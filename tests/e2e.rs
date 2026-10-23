@@ -106,7 +106,10 @@ fn git_clone_is_materialized_by_xet_init() {
     env.jj(&repo, &["git", "push", "--bookmark", "main"]);
     assert!(dir_size(&remote) < BIG_SIZE as u64 / 10);
 
-    git(env.dir.path(), &["clone", "-q", "remote.git", "clone"]);
+    git(
+        env.dir.path(),
+        &["clone", "-q", "-b", "main", "remote.git", "clone"],
+    );
     let clone = env.path("clone");
     assert!(
         fs::read_to_string(clone.join("big.bin"))

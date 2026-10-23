@@ -14,6 +14,7 @@ The jj-lib sources are found through `cargo metadata`, so they are exactly the
 ones the build uses.
 """
 
+import difflib
 import json
 import pathlib
 import re
@@ -64,29 +65,20 @@ def write_adapted(out_dir):
 
 
 def diff():
+    # difflib rather than diff(1), whose output differs between GNU and BSD.
     with tempfile.TemporaryDirectory() as tmp:
-        upstream = pathlib.Path(tmp) / "upstream"
-        upstream.mkdir()
+        upstream = pathlib.Path(tmp)
         write_adapted(upstream)
         chunks = []
         for name in FILES:
-            result = subprocess.run(
-                [
-                    "diff",
-                    "-u",
-                    "--label",
+            chunks.extend(
+                difflib.unified_diff(
+                    (upstream / name).read_text().splitlines(keepends=True),
+                    (VENDOR / name).read_text().splitlines(keepends=True),
                     f"a/{name}",
-                    "--label",
                     f"b/{name}",
-                    str(upstream / name),
-                    str(VENDOR / name),
-                ],
-                capture_output=True,
-                text=True,
+                )
             )
-            if result.returncode > 1:
-                sys.exit(result.stderr)
-            chunks.append(result.stdout)
         return "".join(chunks)
 
 

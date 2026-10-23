@@ -122,13 +122,10 @@
              )
              .await?;
              match new_file_ids.into_resolved() {
-@@ -2101,7 +2140,45 @@
-             }
-         } else {
-             Ok(current_tree_values.clone())
-+        }
-+    }
-+
+@@ -2104,11 +2143,55 @@
+         }
+     }
+ 
 +    /// Moves the file's contents into Xet if it qualifies, returning the
 +    /// pointer to store instead. Files that already are pointers are left
 +    /// alone so they round-trip unchanged.
@@ -146,7 +143,7 @@
 +            .len();
 +        if !self.tree_state.xet.should_clean(path, size) {
 +            return Ok(None);
-         }
++        }
 +        if (size as usize) < MAX_POINTER_SIZE {
 +            let contents = fs::read(disk_path).map_err(|err| SnapshotError::Other {
 +                message: format!("Failed to read file {}", disk_path.display()),
@@ -165,10 +162,10 @@
 +                    err: err.into(),
 +                })?;
 +        Ok(Some(pointer))
-     }
- 
++    }
++
      async fn write_file_to_store(
-@@ -2109,6 +2186,12 @@
+         &self,
          path: &RepoPath,
          disk_path: &Path,
      ) -> Result<FileId, SnapshotError> {
