@@ -1,0 +1,396 @@
+--- a/local_working_copy.rs
++++ b/local_working_copy.rs
+@@ -59,8 +59,11 @@
+ use tracing::instrument;
+ use tracing::trace_span;
+ 
++use crate::pointer::MAX_POINTER_SIZE;
++use crate::pointer::Pointer;
+ pub use crate::vendor::eol::EolConversionMode;
+ use crate::vendor::eol::TargetEolStrategy;
++use crate::xet::XetFilter;
+ use jj_lib::backend::BackendError;
+ use jj_lib::backend::CopyId;
+ use jj_lib::backend::FileId;
+@@ -975,6 +978,8 @@
+     pub exec_change_setting: ExecChangeSetting,
+     /// The fsmonitor (e.g. Watchman) to use, if any.
+     pub fsmonitor_settings: FsmonitorSettings,
++    /// Where and when file contents are moved into Xet storage.
++    pub xet: Arc<XetFilter>,
+ }
+ 
+ impl TreeStateSettings {
+@@ -985,6 +990,7 @@
+             eol_conversion_mode: EolConversionMode::try_from_settings(user_settings)?,
+             exec_change_setting: user_settings.get("working-copy.exec-bit-change")?,
+             fsmonitor_settings: FsmonitorSettings::from_settings(user_settings)?,
++            xet: Arc::new(XetFilter::from_settings(user_settings)?),
+         })
+     }
+ }
+@@ -1009,6 +1015,7 @@
+     exec_policy: ExecChangePolicy,
+     fsmonitor_settings: FsmonitorSettings,
+     target_eol_strategy: TargetEolStrategy,
++    xet: Arc<XetFilter>,
+ }
+ 
+ #[derive(Debug, Error)]
+@@ -1082,6 +1089,7 @@
+             eol_conversion_mode,
+             exec_change_setting,
+             fsmonitor_settings,
++            xet,
+         }: &TreeStateSettings,
+     ) -> Self {
+         let exec_policy = ExecChangePolicy::new(*exec_change_setting, &state_path);
+@@ -1099,6 +1107,7 @@
+             exec_policy,
+             fsmonitor_settings: fsmonitor_settings.clone(),
+             target_eol_strategy: TargetEolStrategy::new(*eol_conversion_mode),
++            xet: xet.clone(),
+         }
+     }
+ 
+@@ -1291,7 +1300,22 @@
+     /// Look for changes to the working copy. If there are any changes, create
+     /// a new tree from it.
+     #[instrument(skip_all)]
++    /// Snapshots in one Xet upload batch, which must complete before the
++    /// snapshot's pointers are returned.
+     pub async fn snapshot(
++        &mut self,
++        options: &SnapshotOptions<'_>,
++    ) -> Result<(bool, SnapshotStats), SnapshotError> {
++        let batch = self.xet.begin_upload_batch();
++        let result = self.snapshot_without_xet_batch(options).await?;
++        batch.finish().map_err(|err| SnapshotError::Other {
++            message: "Failed to finish uploading to Xet".to_string(),
++            err: err.into(),
++        })?;
++        Ok(result)
++    }
++
++    async fn snapshot_without_xet_batch(
+         &mut self,
+         options: &SnapshotOptions<'_>,
+     ) -> Result<(bool, SnapshotStats), SnapshotError> {
+@@ -1803,9 +1827,12 @@
+                     message: format!("Failed to stat file {}", entry.path().display()),
+                     err: err.into(),
+                 })?;
++                // Files headed for Xet don't bloat the git store, so the
++                // new-file size limit doesn't apply to them.
+                 if maybe_current_file_state.is_none()
+                     && (metadata.len() > self.max_new_file_size
+-                        && !self.force_tracking_matcher.matches(&path))
++                        && !self.force_tracking_matcher.matches(&path)
++                        && !self.tree_state.xet.should_clean(&path, metadata.len()))
+                 {
+                     // Leave the large file untracked
+                     let reason = UntrackedReason::FileTooLarge {
+@@ -2063,6 +2090,20 @@
+                     message: "Failed to read the EOL converted contents".to_string(),
+                     err: err.into(),
+                 })?;
++            let conflict_marker_len = materialized_conflict_data
++                .map_or(MIN_CONFLICT_MARKER_LEN, |data| {
++                    data.conflict_marker_len as usize
++                });
++            // Only a resolved file may go to Xet. Text that still parses as a
++            // conflict must reach `update_from_content` unchanged, or an
++            // untouched conflict would be recorded as resolved. Like
++            // `write_file_to_store`, the raw bytes on disk are what's stored.
++            if conflicts::parse_conflict(&contents, old_file_ids.num_sides(), conflict_marker_len)
++                .is_none()
++                && let Some(pointer) = self.clean_large_file(repo_path, disk_path)?
++            {
++                contents = pointer.to_bytes();
++            }
+             // If the file contained a conflict before and is a normal file on
+             // disk, we try to parse any conflict markers in the file into a
+             // conflict.
+@@ -2071,9 +2112,7 @@
+                 self.store(),
+                 repo_path,
+                 &contents,
+-                materialized_conflict_data.map_or(MIN_CONFLICT_MARKER_LEN, |data| {
+-                    data.conflict_marker_len as usize
+-                }),
++                conflict_marker_len,
+             )
+             .await?;
+             match new_file_ids.into_resolved() {
+@@ -2101,7 +2140,45 @@
+             }
+         } else {
+             Ok(current_tree_values.clone())
++        }
++    }
++
++    /// Moves the file's contents into Xet if it qualifies, returning the
++    /// pointer to store instead. Files that already are pointers are left
++    /// alone so they round-trip unchanged.
++    fn clean_large_file(
++        &self,
++        path: &RepoPath,
++        disk_path: &Path,
++    ) -> Result<Option<Pointer>, SnapshotError> {
++        let size = disk_path
++            .metadata()
++            .map_err(|err| SnapshotError::Other {
++                message: format!("Failed to stat file {}", disk_path.display()),
++                err: err.into(),
++            })?
++            .len();
++        if !self.tree_state.xet.should_clean(path, size) {
++            return Ok(None);
+         }
++        if (size as usize) < MAX_POINTER_SIZE {
++            let contents = fs::read(disk_path).map_err(|err| SnapshotError::Other {
++                message: format!("Failed to read file {}", disk_path.display()),
++                err: err.into(),
++            })?;
++            if Pointer::parse(&contents).is_some() {
++                return Ok(None);
++            }
++        }
++        let pointer =
++            self.tree_state
++                .xet
++                .clean_file(disk_path)
++                .map_err(|err| SnapshotError::Other {
++                    message: format!("Failed to store {} in Xet", disk_path.display()),
++                    err: err.into(),
++                })?;
++        Ok(Some(pointer))
+     }
+ 
+     async fn write_file_to_store(
+@@ -2109,6 +2186,12 @@
+         path: &RepoPath,
+         disk_path: &Path,
+     ) -> Result<FileId, SnapshotError> {
++        if let Some(pointer) = self.clean_large_file(path, disk_path)? {
++            return Ok(self
++                .store()
++                .write_file(path, &mut pointer.to_bytes().as_slice())
++                .await?);
++        }
+         let file = File::open(disk_path).map_err(|err| SnapshotError::Other {
+             message: format!("Failed to open file {}", disk_path.display()),
+             err: err.into(),
+@@ -2164,12 +2247,123 @@
+ 
+ /// Functions to update local-disk files from the store.
+ impl TreeState {
++    /// Replaces pointer files on disk with their contents from Xet. Pointers
++    /// end up on disk when the checkout was made by a stock jj or git, or
++    /// when the contents were unavailable at checkout time.
++    pub fn materialize_xet_pointers(&mut self) -> Result<Vec<RepoPathBuf>, CheckoutError> {
++        let candidates = self
++            .file_states
++            .all()
++            .iter()
++            .filter_map(|(path, state)| match state.file_type {
++                FileType::Normal { exec_bit } if (state.size as usize) < MAX_POINTER_SIZE => {
++                    Some((path.to_owned(), exec_bit))
++                }
++                _ => None,
++            })
++            .collect_vec();
++        let mut changed_file_states = vec![];
++        for (path, exec_bit) in candidates {
++            let disk_path =
++                path.to_fs_path(&self.working_copy_path)
++                    .map_err(|err| CheckoutError::Other {
++                        message: format!("Invalid path {}", path.as_internal_file_string()),
++                        err: err.into(),
++                    })?;
++            let Some(pointer) = fs::read(&disk_path)
++                .ok()
++                .and_then(|contents| Pointer::parse(&contents))
++                .filter(|pointer| self.xet.should_clean(&path, pointer.size))
++            else {
++                continue;
++            };
++            let state = match self.smudge_in_place(&disk_path, &pointer, exec_bit)? {
++                Ok(state) => state,
++                Err(err) => {
++                    eprintln!(
++                        "Warning: Could not fetch {} from Xet ({err}); leaving the pointer file",
++                        disk_path.display()
++                    );
++                    continue;
++                }
++            };
++            changed_file_states.push((path, state));
++        }
++        let paths = changed_file_states
++            .iter()
++            .map(|(path, _)| path.clone())
++            .collect();
++        self.file_states
++            .merge_in(changed_file_states, &HashSet::new());
++        Ok(paths)
++    }
++
++    /// Reconstructs `pointer` into a temporary file and moves it to
++    /// `disk_path` only once it is complete and verified. The outer
++    /// error is a local I/O failure; the inner one means the contents could
++    /// not be fetched, and nothing was written.
++    fn smudge_in_place(
++        &self,
++        disk_path: &Path,
++        pointer: &Pointer,
++        exec_bit: ExecBit,
++    ) -> Result<Result<FileState, io::Error>, CheckoutError> {
++        // The temporary file lives in the state directory, so an interrupted
++        // checkout (jj exits on Ctrl-C without running destructors) never
++        // leaves a stray file that the next snapshot would track.
++        let temp_file =
++            NamedTempFile::new_in(&self.state_path).map_err(|err| CheckoutError::Other {
++                message: format!(
++                    "Failed to create a temporary file in {}",
++                    self.state_path.display()
++                ),
++                err: err.into(),
++            })?;
++        let size = match self.xet.smudge_to_file(pointer, temp_file.as_file()) {
++            Ok(size) => size,
++            Err(err) => return Ok(Err(err)),
++        };
++        set_executable(exec_bit, temp_file.path())
++            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
++        let replace_error = |err: io::Error| CheckoutError::Other {
++            message: format!("Failed to replace {}", disk_path.display()),
++            err: err.into(),
++        };
++        temp_file.as_file().sync_data().map_err(replace_error)?;
++        let file = match temp_file.persist(disk_path) {
++            Ok(file) => file,
++            // The state directory is on another filesystem than the
++            // workspace; fall back to copying.
++            Err(err) if err.error.kind() == io::ErrorKind::CrossesDevices => {
++                let temp_file = err.file;
++                let parent = disk_path.parent().unwrap_or(&self.working_copy_path);
++                let mut local = NamedTempFile::new_in(parent).map_err(replace_error)?;
++                io::copy(&mut temp_file.reopen().map_err(replace_error)?, &mut local)
++                    .map_err(replace_error)?;
++                set_executable(exec_bit, local.path())
++                    .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
++                persist_temp_file(local, disk_path).map_err(replace_error)?
++            }
++            Err(err) => return Err(replace_error(err.error)),
++        };
++        let metadata = file
++            .metadata()
++            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
++        FileState::for_file(exec_bit, size, &metadata)
++            .map(Ok)
++            .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
++    }
++
++    /// Writes a file. If `xet_path` is set and the contents are a pointer that
++    /// snapshotting `xet_path` would produce, the pointed-to contents are
++    /// written instead.
+     async fn write_file(
+         &self,
+         disk_path: &Path,
+         contents: impl AsyncRead + Send + Unpin,
+         exec_bit: ExecBit,
+-        apply_eol_conversion: bool,
++        mut apply_eol_conversion: bool,
++        xet_path: Option<&RepoPath>,
+     ) -> Result<FileState, CheckoutError> {
+         let mut file = File::options()
+             .write(true)
+@@ -2179,6 +2373,37 @@
+                 message: format!("Failed to open file {} for writing", disk_path.display()),
+                 err: err.into(),
+             })?;
++        let mut contents = contents;
++        let mut head = Vec::with_capacity(MAX_POINTER_SIZE + 1);
++        (&mut contents)
++            .take(MAX_POINTER_SIZE as u64 + 1)
++            .read_to_end(&mut head)
++            .await
++            .map_err(|err| CheckoutError::Other {
++                message: format!("Failed to read the content for {}", disk_path.display()),
++                err: err.into(),
++            })?;
++        // Only pointers that snapshotting would produce for this path are
++        // smudged, so files that merely look like pointers round-trip.
++        let pointer = xet_path.and_then(|path| {
++            Pointer::parse(&head).filter(|pointer| self.xet.should_clean(path, pointer.size))
++        });
++        if let Some(pointer) = pointer {
++            match self.smudge_in_place(disk_path, &pointer, exec_bit)? {
++                Ok(file_state) => return Ok(file_state),
++                Err(err) => {
++                    // Leave the pointer in place, like `GIT_LFS_SKIP_SMUDGE`.
++                    // It must stay byte-identical so that snapshotting records
++                    // the same pointer and `jj xet init` can fetch it later.
++                    eprintln!(
++                        "Warning: Could not fetch {} from Xet ({err}); leaving the pointer file",
++                        disk_path.display()
++                    );
++                    apply_eol_conversion = false;
++                }
++            }
++        }
++        let contents = futures::io::Cursor::new(head).chain(contents);
+         let contents = if apply_eol_conversion {
+             self.target_eol_strategy
+                 .convert_eol_for_update(contents)
+@@ -2476,7 +2701,7 @@
+                 MaterializedTreeValue::File(file) => {
+                     let exec_bit =
+                         ExecBit::new_from_repo(file.executable, self.exec_policy, get_prev_exec);
+-                    self.write_file(&disk_path, file.reader, exec_bit, true)
++                    self.write_file(&disk_path, file.reader, exec_bit, true, Some(&path))
+                         .await?
+                 }
+                 MaterializedTreeValue::Symlink { id: _, target } => {
+@@ -2484,7 +2709,7 @@
+                         self.write_symlink(&disk_path, target)?
+                     } else {
+                         // The fake symlink file shouldn't be executable.
+-                        self.write_file(&disk_path, target.as_bytes(), ExecBit(false), false)
++                        self.write_file(&disk_path, target.as_bytes(), ExecBit(false), false, None)
+                             .await?
+                     }
+                 }
+@@ -2788,7 +3013,7 @@
+ }
+ 
+ impl LocalWorkingCopy {
+-    pub const NAME: &str = "local";
++    pub const NAME: &str = "xet";
+ 
+     /// Initializes a new working copy at `working_copy_path`. The working
+     /// copy's state will be stored in the `state_path` directory. The working
+@@ -2960,6 +3185,22 @@
+     _lock: FileLock,
+ }
+ 
++impl LockedLocalWorkingCopy {
++    /// See [`TreeState::materialize_xet_pointers`].
++    pub fn materialize_xet_pointers(&mut self) -> Result<Vec<RepoPathBuf>, CheckoutError> {
++        let tree_state = self
++            .wc
++            .tree_state_mut()
++            .map_err(|err| CheckoutError::Other {
++                message: "Failed to load the working copy state".to_string(),
++                err: err.into(),
++            })?;
++        let paths = tree_state.materialize_xet_pointers()?;
++        self.tree_state_dirty |= !paths.is_empty();
++        Ok(paths)
++    }
++}
++
+ #[async_trait]
+ impl LockedWorkingCopy for LockedLocalWorkingCopy {
+     fn old_operation_id(&self) -> &OperationId {

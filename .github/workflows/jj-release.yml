@@ -1,0 +1,112 @@
+# jj-xet vendors jj's working copy, so every jj release needs a re-sync. This
+# opens a PR when a new release applies cleanly and passes the tests, and an
+# issue when it needs a human.
+name: Track jj releases
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: jj-release
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare versions
+        id: versions
+        run: |
+          current=$(sed -n 's/^jj-lib = "=\(.*\)"$/\1/p' Cargo.toml)
+          latest=$(curl -fsSL -A "jj-xet release tracker (github.com/${{ github.repository }})" \
+            https://crates.io/api/v1/crates/jj-lib | jq -r .crate.max_stable_version)
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ -n "$latest" ] && [ "$latest" != "$current" ]; then
+            echo "outdated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.versions.outputs.outdated
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - if: steps.versions.outputs.outdated
+        uses: Swatinem/rust-cache@v2
+
+      - name: Re-vendor
+        id: sync
+        if: steps.versions.outputs.outdated
+        continue-on-error: true
+        run: python3 scripts/vendor_jj.py sync "${{ steps.versions.outputs.latest }}" 2>&1 | tee sync.log
+
+      - name: Test
+        id: test
+        if: steps.versions.outputs.outdated && steps.sync.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          { cargo clippy --all-targets -- -D warnings && cargo test; } 2>&1 | tee test.log
+
+      - name: Open PR
+        if: steps.test.outcome == 'success'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: jj-release/${{ steps.versions.outputs.latest }}
+          title: Update jj to ${{ steps.versions.outputs.latest }}
+          commit-message: Update jj to ${{ steps.versions.outputs.latest }}
+          body: |
+            jj ${{ steps.versions.outputs.latest }} is out. `src/vendor/xet.patch` applied cleanly and all tests pass.
+
+            Upstream changes: https://github.com/jj-vcs/jj/blob/main/CHANGELOG.md
+
+            Before merging, skim the upstream diff of `lib/src/local_working_copy.rs` for new code paths that read or write file contents, which would need the Xet filter too.
+          add-paths: |
+            Cargo.toml
+            Cargo.lock
+            src/vendor/
+
+      - name: Open issue
+        if: steps.versions.outputs.outdated && (steps.sync.outcome == 'failure' || steps.test.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.versions.outputs.latest }}
+        run: |
+          title="Re-vendor jj $VERSION by hand"
+          if gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number' | grep -q .; then
+            exit 0
+          fi
+          {
+            echo "The automatic update to jj $VERSION failed."
+            echo
+            echo "Reproduce with \`scripts/vendor_jj.py sync $VERSION\`, then fix the vendored files and run \`scripts/vendor_jj.py diff\`."
+            for log in sync.log test.log; do
+              [ -f "$log" ] || continue
+              echo
+              echo "<details><summary>$log</summary>"
+              echo
+              echo '```'
+              tail -n 150 "$log"
+              echo '```'
+              echo "</details>"
+            done
+            for rej in src/vendor/*.rej; do
+              [ -f "$rej" ] || continue
+              echo
+              echo "<details><summary>$rej</summary>"
+              echo
+              echo '```diff'
+              cat "$rej"
+              echo '```'
+              echo "</details>"
+            done
+          } > body.md
+          gh issue create --title "$title" --body-file body.md
